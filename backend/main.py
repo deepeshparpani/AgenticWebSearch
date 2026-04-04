@@ -1,10 +1,10 @@
 """
 Agentic Search & Entity Extraction Backend
 ==========================================
-FastAPI backend that orchestrates a 3-step pipeline with live SSE streaming:
-  1. Search   – DuckDuckGo to collect top URLs for a query
-  2. Scrape   – Jina AI Reader API to bypass bot-protection & JS rendering
-  3. Extract  – Gemini 2.5 Flash with structured JSON output to identify entities
+FastAPI backend orchestrating a 3-step pipeline with live SSE streaming:
+  1. Search   – DuckDuckGo over-fetch (12 URLs) with CAPTCHA-wall exclusions
+  2. Scrape   – Jina AI Reader API (JS rendering, bot-protection bypass)
+  3. Extract  – Gemini 2.5 Flash with structured JSON + count enforcement
 """
 
 import os
@@ -15,7 +15,6 @@ import time
 from typing import Optional, AsyncGenerator
 
 from dotenv import load_dotenv
-from ddgs import DDGS
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -23,7 +22,12 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-from services import scrape_url_single, scrape_urls
+from services import (
+    search_web,
+    scrape_url_single,
+    scrape_urls,
+    format_scraped_results,
+)
 
 # ---------------------------------------------------------------------------
 # Config & Logging
@@ -59,7 +63,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ---------------------------------------------------------------------------
 # Pydantic / JSON Schema Models
 # ---------------------------------------------------------------------------
@@ -69,13 +72,13 @@ class Entity(BaseModel):
     key_features: list[str] = Field(description="2-5 specific, notable features or capabilities.")
     source_url: str = Field(
         description=(
-            "The EXACT URL from the provided sources. "
-            "Must match one of the URLs in the context — never fabricate URLs."
+            "The EXACT SOURCE URL where this entity's information was found. "
+            "Must match a URL from the SOURCE headers in the context — never fabricate."
         )
     )
     category: Optional[str] = Field(
         default=None,
-        description="Category label (e.g. 'Database', 'Framework', 'Library', 'Concept').",
+        description="Category label (e.g. 'Restaurant', 'Database', 'Framework', 'Concept').",
     )
 
 
@@ -86,61 +89,41 @@ class ExtractionResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline constants
+# LLM Extraction
 # ---------------------------------------------------------------------------
-MAX_URLS = 5
-MAX_CHARS_PER_PAGE = 4000
-MAX_TOTAL_CHARS = 16000
+MAX_TOTAL_CHARS = 24000  # Increased — Gemini 2.5 Flash handles large context well
 
 
-# ---------------------------------------------------------------------------
-# Core pipeline helpers
-# ---------------------------------------------------------------------------
-def _ddg_search(query: str, max_results: int) -> list[str]:
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
-    return [r["href"] for r in results if "href" in r]
+def build_prompt(query: str, context: str) -> str:
+    """
+    Build the Gemini extraction prompt.
 
+    Args:
+        query:   The user's original search query.
+        context: Pre-formatted labeled string from scrape_urls() / format_scraped_results().
+    """
+    # Truncate context if it exceeds the cap
+    if len(context) > MAX_TOTAL_CHARS:
+        context = context[:MAX_TOTAL_CHARS] + "\n[...truncated for context limit...]"
 
-async def search_urls(query: str, max_results: int = MAX_URLS) -> list[str]:
-    loop = asyncio.get_event_loop()
-    urls = await loop.run_in_executor(None, _ddg_search, query, max_results)
-    logger.info(f"[SEARCH] Found {len(urls)} URLs: {urls}")
-    return urls
-
-
-def build_prompt(query: str, scraped: list[dict]) -> str:
-    """Build the LLM extraction prompt from a list of {url, content} dicts."""
-    sources_block = ""
-    total = 0
-    for idx, item in enumerate(scraped, 1):
-        url = item["url"]
-        chunk = item["content"][:MAX_CHARS_PER_PAGE]
-        if total + len(chunk) > MAX_TOTAL_CHARS:
-            chunk = chunk[: MAX_TOTAL_CHARS - total]
-        sources_block += f"\n\n--- SOURCE {idx} ---\nURL: {url}\n\n{chunk}\n"
-        total += len(chunk)
-        if total >= MAX_TOTAL_CHARS:
-            break
-
-    return f"""You are an expert information extraction system. Analyze the provided web content and extract structured entities relevant to the user's query.
+    return f"""You are an expert information extraction system. Your task is to analyze web content and extract structured entities.
 
 USER QUERY: "{query}"
 
 SCRAPED WEB SOURCES:
-{sources_block}
+{context}
 
-INSTRUCTIONS:
-1. Identify all distinct, meaningful entities (tools, projects, companies, frameworks, concepts, etc.) relevant to the query.
-2. For EACH entity, include the exact source_url from the SOURCE headers above — never invent URLs.
-3. Extract between 5 and 15 high-quality entities.
-4. key_features must be concrete and specific, not generic.
-5. Return ONLY valid JSON matching the required schema.
+EXTRACTION RULES:
+1. Analyze the provided context from multiple web pages. You MUST extract enough entities to satisfy the user's query (e.g., if they ask for "top 5", you must return exactly 5 distinct entities; if they ask for "top 10", return exactly 10). Do not duplicate entities. If there are more than requested available, pick the best and most relevant ones.
+2. For EACH entity, the source_url MUST exactly match a URL that appears after "SOURCE:" in the context above — never invent or modify URLs.
+3. key_features must be concrete and specific (e.g. actual dish names, opening hours, price range, cuisine type) — not generic statements like "high quality" or "great service".
+4. Return ONLY valid JSON matching the required schema. No commentary outside the JSON.
 """
 
 
-async def extract_entities(query: str, scraped: list[dict]) -> ExtractionResult:
-    prompt = build_prompt(query, scraped)
+async def extract_entities(query: str, context: str) -> ExtractionResult:
+    """Call Gemini 2.5 Flash with structured JSON output to extract entities."""
+    prompt = build_prompt(query, context)
     logger.info(f"[EXTRACT] Prompt length={len(prompt)} chars")
     loop = asyncio.get_event_loop()
 
@@ -157,6 +140,7 @@ async def extract_entities(query: str, scraped: list[dict]) -> ExtractionResult:
         return response.text
 
     raw = await loop.run_in_executor(None, _call)
+    logger.info(f"[EXTRACT] Gemini response length={len(raw)} chars")
     data = json.loads(raw)
     return ExtractionResult(**data)
 
@@ -173,7 +157,7 @@ def sse(event: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "scraper": "jina-ai"}
+    return {"status": "ok", "scraper": "jina-ai", "model": "gemini-2.5-flash"}
 
 
 @app.get("/api/research/stream")
@@ -181,7 +165,7 @@ async def research_stream(
     query: str = Query(..., min_length=3, description="Natural language research topic"),
 ):
     """
-    SSE streaming endpoint. Emits typed events at each pipeline stage:
+    SSE streaming endpoint. Emits typed events:
       search_done      → { urls, elapsed_ms }
       scrape_url_done  → { url, status: 'ok'|'skip', chars, elapsed_ms }
       scrape_done      → { scraped_count, elapsed_ms }
@@ -195,9 +179,9 @@ async def research_stream(
         try:
             loop = asyncio.get_event_loop()
 
-            # ── Step 1: Search ──────────────────────────────────────────────
+            # ── Step 1: Search (over-fetch 12 URLs) ────────────────────────
             t0 = time.monotonic()
-            urls = await search_urls(query)
+            urls = await loop.run_in_executor(None, search_web, query)
             search_ms = int((time.monotonic() - t0) * 1000)
 
             if not urls:
@@ -206,13 +190,12 @@ async def research_stream(
 
             await queue.put(("search_done", {"urls": urls, "elapsed_ms": search_ms}))
 
-            # ── Step 2: Scrape via Jina (per-URL SSE events) ─────────────────
+            # ── Step 2: Scrape via Jina (concurrent, per-URL SSE events) ────
             t1 = time.monotonic()
-            scraped: list[dict] = []
+            scraped_results: list[dict] = []
 
             async def scrape_and_emit(url: str):
                 t = time.monotonic()
-                # Run sync Jina request in thread pool
                 result = await loop.run_in_executor(None, scrape_url_single, url)
                 elapsed = int((time.monotonic() - t) * 1000)
                 status = "ok" if result else "skip"
@@ -225,22 +208,24 @@ async def research_stream(
                 }))
                 return result
 
-            results = await asyncio.gather(*[scrape_and_emit(u) for u in urls])
-            scraped = [r for r in results if r is not None]
+            raw_results = await asyncio.gather(*[scrape_and_emit(u) for u in urls])
+            scraped_results = [r for r in raw_results if r is not None]
 
             scrape_ms = int((time.monotonic() - t1) * 1000)
 
-            if not scraped:
+            if not scraped_results:
                 await queue.put(("error", {"message": "Jina AI could not extract content from any URL. Try a different query."}))
                 return
 
-            await queue.put(("scrape_done", {"scraped_count": len(scraped), "elapsed_ms": scrape_ms}))
+            # Convert to labeled string for LLM
+            context = format_scraped_results(scraped_results)
+            await queue.put(("scrape_done", {"scraped_count": len(scraped_results), "elapsed_ms": scrape_ms}))
 
             # ── Step 3: Extract ─────────────────────────────────────────────
             t2 = time.monotonic()
-            result = await extract_entities(query, scraped)
+            result = await extract_entities(query, context)
             extract_ms = int((time.monotonic() - t2) * 1000)
-            result.total_sources_scraped = len(scraped)
+            result.total_sources_scraped = len(scraped_results)
             result.query = query
 
             await queue.put(("extract_done", {"elapsed_ms": extract_ms}))
@@ -280,21 +265,21 @@ async def research_stream(
     )
 
 
-# Keep the original blocking endpoint for curl/testing convenience
+# Blocking endpoint — useful for curl testing
 @app.get("/api/research", response_model=ExtractionResult)
 async def research(query: str = Query(..., min_length=3)):
-    urls = await search_urls(query)
+    loop = asyncio.get_event_loop()
+
+    urls = await loop.run_in_executor(None, search_web, query)
     if not urls:
         raise HTTPException(status_code=502, detail="DuckDuckGo returned no results.")
 
-    loop = asyncio.get_event_loop()
-    scraped = await loop.run_in_executor(None, scrape_urls, urls)
-
-    if not scraped:
+    context = await loop.run_in_executor(None, scrape_urls, urls)
+    if not context.strip():
         raise HTTPException(status_code=502, detail="Jina AI could not extract content from any URL.")
 
-    result = await extract_entities(query, scraped)
-    result.total_sources_scraped = len(scraped)
+    result = await extract_entities(query, context)
+    result.total_sources_scraped = context.count("SOURCE: ")
     result.query = query
     return result
 
