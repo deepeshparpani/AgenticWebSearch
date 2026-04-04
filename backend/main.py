@@ -80,6 +80,15 @@ class Entity(BaseModel):
         default=None,
         description="Category label (e.g. 'Restaurant', 'Database', 'Framework', 'Concept').",
     )
+    ranking_rationale: str = Field(
+        description=(
+            "A concise 1-2 sentence explanation of why this entity was chosen and why it "
+            "deserves its rank, citing specific signals from the provided text "
+            "(e.g., 'Mentioned across 3 different local blogs,' "
+            "'Highly recommended on Reddit for its wood-fired crust,' or "
+            "'Listed as the #1 choice on the Chamber of Commerce site')."
+        )
+    )
 
 
 class ExtractionResult(BaseModel):
@@ -117,7 +126,8 @@ EXTRACTION RULES:
 1. Analyze the provided context from multiple web pages. You MUST extract enough entities to satisfy the user's query (e.g., if they ask for "top 5", you must return exactly 5 distinct entities; if they ask for "top 10", return exactly 10). Do not duplicate entities. If there are more than requested available, pick the best and most relevant ones.
 2. For EACH entity, the source_url MUST exactly match a URL that appears after "SOURCE:" in the context above — never invent or modify URLs.
 3. key_features must be concrete and specific (e.g. actual dish names, opening hours, price range, cuisine type) — not generic statements like "high quality" or "great service".
-4. Return ONLY valid JSON matching the required schema. No commentary outside the JSON.
+4. For each entity you extract, you must provide a ranking_rationale. This should be a concise 1-2 sentence explanation of why this entity was chosen and why it deserves its rank, citing specific signals from the provided text (e.g., 'Mentioned across 3 different local blogs,' 'Highly recommended on Reddit for its wood-fired crust,' or 'Listed as the #1 choice on the Chamber of Commerce site').
+5. Return ONLY valid JSON matching the required schema. No commentary outside the JSON.
 """
 
 
