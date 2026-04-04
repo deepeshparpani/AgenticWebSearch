@@ -31,23 +31,23 @@ _EXCLUDED_SITES = (
 )
 
 
-def calculate_target_urls(query: str, default: int = 8, buffer: int = 4) -> int:
+def calculate_target_urls(query: str, default: int = 12, buffer: int = 10) -> int:
     """
     Parse the user's query for an explicit number and calculate how many
-    URLs to fetch so there's a comfortable buffer above the requested count.
+    URLs to fetch so there's a massive buffer to survive the Domain Router.
 
     Examples:
-      "top 5 pizza places"  → 5 + 4 = 9
-      "best 10 databases"   → 10 + 4 = 14  (clamped to 15)
-      "open source tools"   → default = 8
+      "top 5 pizza places"  → 5 + 10 = 15
+      "best 10 databases"   → 10 + 10 = 20  (clamped to 20)
+      "open source tools"   → default = 12
 
     Args:
         query:   The user's raw search query.
-        default: URLs to fetch when no number is detected (default 8).
-        buffer:  Extra URLs fetched above the requested count (default 4).
+        default: URLs to fetch when no number is detected (default 12).
+        buffer:  Extra URLs fetched above the requested count to survive filtering (default 10).
 
     Returns:
-        An integer in [5, 15].
+        An integer in [8, 20].
     """
     match = re.search(r'\b(\d+)\b', query)
     if match:
@@ -56,7 +56,8 @@ def calculate_target_urls(query: str, default: int = 8, buffer: int = 4) -> int:
     else:
         target = default
 
-    clamped = max(5, min(target, 15))
+    # Clamped higher (8 to 20) to ensure we survive aggressive Bouncer filtering
+    clamped = max(8, min(target, 20))
     logger.info(
         f"[SEARCH] calculate_target_urls: query={query!r} "
         f"→ target={target} clamped={clamped}"
@@ -86,16 +87,74 @@ def search_web(query: str, max_results: int = 12) -> list[str]:
 # ---------------------------------------------------------------------------
 
 JINA_BASE = "https://r.jina.ai/"
-JINA_TIMEOUT = 15.0       # seconds per request attempt
+JINA_TIMEOUT = 8.0       # seconds per request attempt
 JINA_RETRY_BACKOFF = 1.5  # seconds to wait between retry attempts
 MAX_CHARS_PER_PAGE = 4000
 
 _JINA_HEADERS = {"Accept": "application/json"}
 
 
+def optimize_scraped_text(raw_text: str, query: str, max_chars: int = 4000) -> str:
+    """
+    Heuristic Context Compression — prioritizes query-relevant sentences.
+
+    Instead of hard-truncating at max_chars (which discards potentially
+    relevant content at the bottom of long pages), this function:
+      1. Extracts meaningful keywords (4+ letters) from the user's query.
+      2. Splits the page into sentence-level chunks (split on ". ").
+      3. Ranks chunks: relevant ones (containing any keyword) come first.
+      4. Fills up to max_chars, starting with relevant chunks.
+
+    This maximises signal density in the LLM context window — a page that
+    mentions the query topic deep in the article body will be compressed
+    correctly, not silently truncated.
+
+    Args:
+        raw_text: Full text returned by Jina AI.
+        query:    The user's original search query (used for keyword extraction).
+        max_chars: Character budget for the compressed output.
+
+    Returns:
+        Compressed string that fits within max_chars, relevant content first.
+    """
+    # Extract meaningful keywords (4+ letters avoids noise like 'the', 'in')
+    keywords = [w.lower() for w in re.findall(r'\b\w{4,}\b', query)]
+
+    # Normalise whitespace
+    cleaned = ' '.join(raw_text.split())
+
+    # Split on sentence boundaries
+    chunks = [c.strip() for c in cleaned.split('. ') if c.strip()]
+
+    # Partition by keyword relevance
+    relevant_chunks: list[str] = []
+    other_chunks: list[str] = []
+    for chunk in chunks:
+        lower = chunk.lower()
+        if any(kw in lower for kw in keywords):
+            relevant_chunks.append(chunk)
+        else:
+            other_chunks.append(chunk)
+
+    # Reassemble: relevant first, then filler up to budget
+    compressed = ''
+    for chunk in relevant_chunks + other_chunks:
+        candidate = (compressed + '. ' + chunk) if compressed else chunk
+        if len(candidate) > max_chars:
+            break
+        compressed = candidate
+
+    logger.debug(
+        f"[COMPRESS] {len(raw_text)} → {len(compressed)} chars "
+        f"({len(relevant_chunks)} relevant / {len(other_chunks)} other chunks)"
+    )
+    return compressed
+
+
 async def fetch_with_retry(
     client: httpx.AsyncClient,
     url: str,
+    query: str,
     max_retries: int = 2,
 ) -> dict | None:
     """
@@ -104,6 +163,9 @@ async def fetch_with_retry(
     Jina proxies through a headless browser (JS rendering, bot-protection
     bypass). Intermittent 403s or empty responses indicate Jina is rotating
     its egress IP — a short backoff before retry usually resolves this.
+
+    The raw content is passed through optimize_scraped_text to prioritise
+    query-relevant sentences before truncating to MAX_CHARS_PER_PAGE.
 
     Retry policy:
       - Up to `max_retries` total attempts per URL.
@@ -114,6 +176,7 @@ async def fetch_with_retry(
     Args:
         client:      A shared httpx.AsyncClient instance (connection pooling).
         url:         The target URL to fetch.
+        query:       The user's search query (for context-aware compression).
         max_retries: Total attempts allowed (default 2).
 
     Returns:
@@ -132,11 +195,11 @@ async def fetch_with_retry(
 
             if response.status_code == 200:
                 data = response.json()
-                content = data.get("data", {}).get("content", "").strip()
+                raw_content = data.get("data", {}).get("content", "").strip()
 
-                if content:
-                    # ✅ Success — return immediately, no further retries needed
-                    content = content[:MAX_CHARS_PER_PAGE]
+                if raw_content:
+                    # ✅ Success — compress then return, no further retries
+                    content = optimize_scraped_text(raw_content, query, MAX_CHARS_PER_PAGE)
                     logger.info(
                         f"[SCRAPE] OK  {url} ({len(content)} chars, "
                         f"attempt {attempt + 1}/{max_retries})"
@@ -180,16 +243,18 @@ async def fetch_with_retry(
     return None
 
 
-async def scrape_urls_async(urls: list[str], max_retries: int = 2) -> list[dict]:
+async def scrape_urls_async(urls: list[str], query: str, max_retries: int = 2) -> list[dict]:
     """
     Concurrently scrape a list of URLs via Jina AI with per-URL retry logic.
 
     Uses a single shared httpx.AsyncClient for connection pooling across all
     concurrent requests. asyncio.gather runs all URL fetches in parallel —
-    retries on individual URLs do not block other URLs.
+    retries on individual URLs do not block other URLs. The query is threaded
+    through to fetch_with_retry for context-aware content compression.
 
     Args:
         urls:        List of target URLs to fetch.
+        query:       The user's search query (passed to optimize_scraped_text).
         max_retries: Max attempts per URL (passed to fetch_with_retry).
 
     Returns:
@@ -198,7 +263,7 @@ async def scrape_urls_async(urls: list[str], max_retries: int = 2) -> list[dict]
     """
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(
-            *[fetch_with_retry(client, url, max_retries) for url in urls],
+            *[fetch_with_retry(client, url, query, max_retries) for url in urls],
             return_exceptions=True,
         )
 

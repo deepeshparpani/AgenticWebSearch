@@ -211,7 +211,7 @@ async def research_stream(
 
             async def scrape_and_emit(url: str, client: httpx.AsyncClient):
                 t = time.monotonic()
-                result = await fetch_with_retry(client, url)
+                result = await fetch_with_retry(client, url, query)
                 elapsed = int((time.monotonic() - t) * 1000)
                 status = "ok" if result else "skip"
                 chars = len(result["content"]) if result else 0
@@ -294,7 +294,7 @@ async def research(query: str = Query(..., min_length=3)):
     if not urls:
         raise HTTPException(status_code=502, detail="DuckDuckGo returned no results.")
 
-    scraped = await scrape_urls_async(urls)
+    scraped = await scrape_urls_async(urls, query)
     if not scraped:
         raise HTTPException(status_code=502, detail="Jina AI could not extract content from any URL.")
 
