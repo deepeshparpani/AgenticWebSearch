@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+ddgs
+trafilatura
+google-genai
+pydantic
+python-dotenv
+httpx
