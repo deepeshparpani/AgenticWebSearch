@@ -14,6 +14,8 @@ import json
 import time
 from typing import Optional, AsyncGenerator
 
+import httpx
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,9 +26,10 @@ from google.genai import types
 
 from services import (
     search_web,
-    scrape_url_single,
-    scrape_urls,
+    fetch_with_retry,
+    scrape_urls_async,
     format_scraped_results,
+    filter_clean_urls,
 )
 
 # ---------------------------------------------------------------------------
@@ -191,7 +194,8 @@ async def research_stream(
 
             # ── Step 1: Search (over-fetch 12 URLs) ────────────────────────
             t0 = time.monotonic()
-            urls = await loop.run_in_executor(None, search_web, query)
+            raw_urls = await loop.run_in_executor(None, search_web, query)
+            urls = filter_clean_urls(raw_urls)
             search_ms = int((time.monotonic() - t0) * 1000)
 
             if not urls:
@@ -202,11 +206,10 @@ async def research_stream(
 
             # ── Step 2: Scrape via Jina (concurrent, per-URL SSE events) ────
             t1 = time.monotonic()
-            scraped_results: list[dict] = []
 
-            async def scrape_and_emit(url: str):
+            async def scrape_and_emit(url: str, client: httpx.AsyncClient):
                 t = time.monotonic()
-                result = await loop.run_in_executor(None, scrape_url_single, url)
+                result = await fetch_with_retry(client, url)
                 elapsed = int((time.monotonic() - t) * 1000)
                 status = "ok" if result else "skip"
                 chars = len(result["content"]) if result else 0
@@ -218,7 +221,10 @@ async def research_stream(
                 }))
                 return result
 
-            raw_results = await asyncio.gather(*[scrape_and_emit(u) for u in urls])
+            async with httpx.AsyncClient() as http_client:
+                raw_results = await asyncio.gather(
+                    *[scrape_and_emit(u, http_client) for u in urls]
+                )
             scraped_results = [r for r in raw_results if r is not None]
 
             scrape_ms = int((time.monotonic() - t1) * 1000)
@@ -280,16 +286,18 @@ async def research_stream(
 async def research(query: str = Query(..., min_length=3)):
     loop = asyncio.get_event_loop()
 
-    urls = await loop.run_in_executor(None, search_web, query)
+    raw_urls = await loop.run_in_executor(None, search_web, query)
+    urls = filter_clean_urls(raw_urls)
     if not urls:
         raise HTTPException(status_code=502, detail="DuckDuckGo returned no results.")
 
-    context = await loop.run_in_executor(None, scrape_urls, urls)
-    if not context.strip():
+    scraped = await scrape_urls_async(urls)
+    if not scraped:
         raise HTTPException(status_code=502, detail="Jina AI could not extract content from any URL.")
 
+    context = format_scraped_results(scraped)
     result = await extract_entities(query, context)
-    result.total_sources_scraped = context.count("SOURCE: ")
+    result.total_sources_scraped = len(scraped)
     result.query = query
     return result
 
