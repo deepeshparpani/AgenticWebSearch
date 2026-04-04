@@ -11,6 +11,7 @@ Provides:
 
 import asyncio
 import logging
+import re
 import httpx
 import requests
 from ddgs import DDGS
@@ -28,6 +29,39 @@ _EXCLUDED_SITES = (
     "-site:zomato.com "
     "-site:doordash.com"
 )
+
+
+def calculate_target_urls(query: str, default: int = 8, buffer: int = 4) -> int:
+    """
+    Parse the user's query for an explicit number and calculate how many
+    URLs to fetch so there's a comfortable buffer above the requested count.
+
+    Examples:
+      "top 5 pizza places"  → 5 + 4 = 9
+      "best 10 databases"   → 10 + 4 = 14  (clamped to 15)
+      "open source tools"   → default = 8
+
+    Args:
+        query:   The user's raw search query.
+        default: URLs to fetch when no number is detected (default 8).
+        buffer:  Extra URLs fetched above the requested count (default 4).
+
+    Returns:
+        An integer in [5, 15].
+    """
+    match = re.search(r'\b(\d+)\b', query)
+    if match:
+        requested = int(match.group(1))
+        target = requested + buffer
+    else:
+        target = default
+
+    clamped = max(5, min(target, 15))
+    logger.info(
+        f"[SEARCH] calculate_target_urls: query={query!r} "
+        f"→ target={target} clamped={clamped}"
+    )
+    return clamped
 
 
 def search_web(query: str, max_results: int = 12) -> list[str]:
@@ -210,17 +244,77 @@ def format_scraped_results(results: list[dict]) -> str:
     )
     return combined
 
-def filter_clean_urls(urls: list[str]) -> list[str]:
-    """Forcefully removes major directory sites (and their international variants)."""
-    # Notice we removed the '.com' and added dots to prevent accidental substring matches
-    bad_domains = [
-        ".yelp.", ".tripadvisor.", ".foursquare.", 
-        ".zomato.", ".doordash.", ".ubereats.", ".grubhub."
+def filter_clean_urls(urls: list[str], query: str) -> list[str]:
+    """
+    Dynamic Domain Router — filters URLs using a universal blocklist plus
+    intent-specific blocklists derived from query keywords.
+
+    Two-layer filtering strategy:
+      Layer 1 (universal):  Remove social media, login walls, and noisy platforms
+                            that apply to every query type.
+      Layer 2 (intent):     Detect the query's domain via keyword heuristics and
+                            append the relevant directory/paywall blocklist.
+
+    Args:
+        urls:  Raw URL list from DuckDuckGo (post search_web()).
+        query: The user's original search query (used for intent detection).
+
+    Returns:
+        Filtered list containing only URLs that pass both layers.
+    """
+    # ── Layer 1: Universal blocklist ─────────────────────────────────────────
+    bad_domains: list[str] = [
+        ".pinterest.",
+        ".instagram.",
+        ".facebook.",
+        ".tiktok.",
+        ".linkedin.",
+        ".quora.",
+        ".medium.",
+        ".reddit.com/login",
     ]
-    
-    clean_urls = []
-    for url in urls:
-        if not any(domain in url for domain in bad_domains):
-            clean_urls.append(url)
-            
-    return clean_urls
+
+    # ── Layer 2: Intent-based routing ────────────────────────────────────────
+    q = query.lower()
+
+    if any(kw in q for kw in ("pizza", "food", "restaurant", "eat", "cafe", "dining")):
+        bad_domains.extend([
+            ".yelp.", ".tripadvisor.", ".foursquare.",
+            ".zomato.", ".doordash.", ".ubereats.", ".grubhub.",
+        ])
+        logger.debug("[FILTER] Intent: Food — extended blocklist applied")
+
+    elif any(kw in q for kw in ("software", "tool", "database", "app", "framework", "library", "api")):
+        bad_domains.extend([
+            ".g2.", ".capterra.", ".trustradius.", ".sourceforge.",
+        ])
+        logger.debug("[FILTER] Intent: Tech/Software — extended blocklist applied")
+
+    elif any(kw in q for kw in ("startup", "company", "business", "healthcare", "enterprise", "funding")):
+        bad_domains.extend([
+            ".crunchbase.", ".pitchbook.", ".zoominfo.", ".glassdoor.",
+        ])
+        logger.debug("[FILTER] Intent: Business — extended blocklist applied")
+
+    elif any(kw in q for kw in ("news", "article", "latest", "update", "today", "breaking")):
+        bad_domains.extend([
+            ".wsj.", ".nytimes.", ".bloomberg.", ".msn.", ".yahoo.",
+        ])
+        logger.debug("[FILTER] Intent: News — extended blocklist applied")
+
+    elif any(kw in q for kw in ("research", "paper", "study", "journal", "academic", "publication")):
+        bad_domains.extend([
+            ".sciencedirect.", ".jstor.", ".springer.", ".ieee.",
+        ])
+        logger.debug("[FILTER] Intent: Academia — extended blocklist applied")
+    elif any(kw in q for kw in ["things to do", "activity", "activities", "attraction", "visit", "travel", "tour"]):
+        bad_domains.extend([".yelp.", ".tripadvisor.", ".foursquare.", ".expedia.", ".viator.", ".getyourguide."])
+        logger.debug("[FILTER] Intent: Travel — extended blocklist applied")
+    # ── Execute filter ────────────────────────────────────────────────────────
+    clean = [u for u in urls if not any(domain in u for domain in bad_domains)]
+
+    logger.info(
+        f"[FILTER] {len(clean)}/{len(urls)} URLs passed "
+        f"(removed {len(urls) - len(clean)})"
+    )
+    return clean

@@ -26,6 +26,7 @@ from google.genai import types
 
 from services import (
     search_web,
+    calculate_target_urls,
     fetch_with_retry,
     scrape_urls_async,
     format_scraped_results,
@@ -192,10 +193,11 @@ async def research_stream(
         try:
             loop = asyncio.get_event_loop()
 
-            # ── Step 1: Search (over-fetch 12 URLs) ────────────────────────
+            # ── Step 1: Search (dynamic URL count based on query) ────────────────
             t0 = time.monotonic()
-            raw_urls = await loop.run_in_executor(None, search_web, query)
-            urls = filter_clean_urls(raw_urls)
+            dynamic_max = calculate_target_urls(query)
+            raw_urls = await loop.run_in_executor(None, search_web, query, dynamic_max)
+            urls = filter_clean_urls(raw_urls, query)
             search_ms = int((time.monotonic() - t0) * 1000)
 
             if not urls:
@@ -286,8 +288,9 @@ async def research_stream(
 async def research(query: str = Query(..., min_length=3)):
     loop = asyncio.get_event_loop()
 
-    raw_urls = await loop.run_in_executor(None, search_web, query)
-    urls = filter_clean_urls(raw_urls)
+    dynamic_max = calculate_target_urls(query)
+    raw_urls = await loop.run_in_executor(None, search_web, query, dynamic_max)
+    urls = filter_clean_urls(raw_urls, query)
     if not urls:
         raise HTTPException(status_code=502, detail="DuckDuckGo returned no results.")
 
