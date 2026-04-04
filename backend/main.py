@@ -3,7 +3,7 @@ Agentic Search & Entity Extraction Backend
 ==========================================
 FastAPI backend that orchestrates a 3-step pipeline with live SSE streaming:
   1. Search   – DuckDuckGo to collect top URLs for a query
-  2. Scrape   – Trafilatura to extract clean text from each URL (with per-URL events)
+  2. Scrape   – Jina AI Reader API to bypass bot-protection & JS rendering
   3. Extract  – Gemini 2.5 Flash with structured JSON output to identify entities
 """
 
@@ -14,8 +14,6 @@ import json
 import time
 from typing import Optional, AsyncGenerator
 
-import httpx
-import trafilatura
 from dotenv import load_dotenv
 from ddgs import DDGS
 from fastapi import FastAPI, HTTPException, Query
@@ -24,6 +22,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+
+from services import scrape_url_single, scrape_urls
 
 # ---------------------------------------------------------------------------
 # Config & Logging
@@ -47,8 +47,8 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Agentic Search API",
-    description="Search → Scrape → Extract pipeline powered by DuckDuckGo, Trafilatura, and Gemini",
-    version="1.0.0",
+    description="Search → Scrape → Extract pipeline powered by DuckDuckGo, Jina AI, and Gemini",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -89,17 +89,8 @@ class ExtractionResult(BaseModel):
 # Pipeline constants
 # ---------------------------------------------------------------------------
 MAX_URLS = 5
-SCRAPE_TIMEOUT = 5
 MAX_CHARS_PER_PAGE = 4000
 MAX_TOTAL_CHARS = 16000
-
-SCRAPE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
 
 
 # ---------------------------------------------------------------------------
@@ -118,27 +109,13 @@ async def search_urls(query: str, max_results: int = MAX_URLS) -> list[str]:
     return urls
 
 
-async def scrape_url(url: str, http_client: httpx.AsyncClient) -> Optional[str]:
-    try:
-        response = await http_client.get(url, timeout=SCRAPE_TIMEOUT, follow_redirects=True)
-        response.raise_for_status()
-        text = trafilatura.extract(
-            response.text,
-            include_comments=False,
-            include_tables=True,
-            no_fallback=False,
-        )
-        return text[:MAX_CHARS_PER_PAGE] if text else None
-    except Exception as exc:
-        logger.warning(f"[SCRAPE] Failed {url}: {exc}")
-        return None
-
-
-def build_prompt(query: str, scraped: dict[str, str]) -> str:
+def build_prompt(query: str, scraped: list[dict]) -> str:
+    """Build the LLM extraction prompt from a list of {url, content} dicts."""
     sources_block = ""
     total = 0
-    for idx, (url, text) in enumerate(scraped.items(), 1):
-        chunk = text[:MAX_CHARS_PER_PAGE]
+    for idx, item in enumerate(scraped, 1):
+        url = item["url"]
+        chunk = item["content"][:MAX_CHARS_PER_PAGE]
         if total + len(chunk) > MAX_TOTAL_CHARS:
             chunk = chunk[: MAX_TOTAL_CHARS - total]
         sources_block += f"\n\n--- SOURCE {idx} ---\nURL: {url}\n\n{chunk}\n"
@@ -162,7 +139,7 @@ INSTRUCTIONS:
 """
 
 
-async def extract_entities(query: str, scraped: dict[str, str]) -> ExtractionResult:
+async def extract_entities(query: str, scraped: list[dict]) -> ExtractionResult:
     prompt = build_prompt(query, scraped)
     logger.info(f"[EXTRACT] Prompt length={len(prompt)} chars")
     loop = asyncio.get_event_loop()
@@ -188,7 +165,6 @@ async def extract_entities(query: str, scraped: dict[str, str]) -> ExtractionRes
 # SSE helpers
 # ---------------------------------------------------------------------------
 def sse(event: str, data: dict) -> str:
-    """Format a single SSE message."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
@@ -197,7 +173,7 @@ def sse(event: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "scraper": "jina-ai"}
 
 
 @app.get("/api/research/stream")
@@ -217,6 +193,8 @@ async def research_stream(
 
     async def pipeline():
         try:
+            loop = asyncio.get_event_loop()
+
             # ── Step 1: Search ──────────────────────────────────────────────
             t0 = time.monotonic()
             urls = await search_urls(query)
@@ -228,40 +206,32 @@ async def research_stream(
 
             await queue.put(("search_done", {"urls": urls, "elapsed_ms": search_ms}))
 
-            # ── Step 2: Scrape (concurrent, per-URL events) ─────────────────
+            # ── Step 2: Scrape via Jina (per-URL SSE events) ─────────────────
             t1 = time.monotonic()
-            scraped: dict[str, str] = {}
+            scraped: list[dict] = []
 
-            async def scrape_and_emit(url: str, client: httpx.AsyncClient):
+            async def scrape_and_emit(url: str):
                 t = time.monotonic()
-                result = await scrape_url(url, client)
+                # Run sync Jina request in thread pool
+                result = await loop.run_in_executor(None, scrape_url_single, url)
                 elapsed = int((time.monotonic() - t) * 1000)
                 status = "ok" if result else "skip"
-                chars = len(result) if result else 0
+                chars = len(result["content"]) if result else 0
                 await queue.put(("scrape_url_done", {
                     "url": url,
                     "status": status,
                     "chars": chars,
                     "elapsed_ms": elapsed,
                 }))
-                return url, result
+                return result
 
-            async with httpx.AsyncClient(headers=SCRAPE_HEADERS) as http_client:
-                pairs = await asyncio.gather(
-                    *[scrape_and_emit(url, http_client) for url in urls],
-                    return_exceptions=True,
-                )
-
-            for item in pairs:
-                if isinstance(item, tuple):
-                    url, text = item
-                    if isinstance(text, str) and text.strip():
-                        scraped[url] = text
+            results = await asyncio.gather(*[scrape_and_emit(u) for u in urls])
+            scraped = [r for r in results if r is not None]
 
             scrape_ms = int((time.monotonic() - t1) * 1000)
 
             if not scraped:
-                await queue.put(("error", {"message": "Could not extract content from any URL. Try a different query."}))
+                await queue.put(("error", {"message": "Jina AI could not extract content from any URL. Try a different query."}))
                 return
 
             await queue.put(("scrape_done", {"scraped_count": len(scraped), "elapsed_ms": scrape_ms}))
@@ -316,14 +286,13 @@ async def research(query: str = Query(..., min_length=3)):
     urls = await search_urls(query)
     if not urls:
         raise HTTPException(status_code=502, detail="DuckDuckGo returned no results.")
-    scraped: dict[str, str] = {}
-    async with httpx.AsyncClient(headers=SCRAPE_HEADERS) as http_client:
-        results = await asyncio.gather(*[scrape_url(u, http_client) for u in urls], return_exceptions=True)
-    for url, text in zip(urls, results):
-        if isinstance(text, str) and text.strip():
-            scraped[url] = text
+
+    loop = asyncio.get_event_loop()
+    scraped = await loop.run_in_executor(None, scrape_urls, urls)
+
     if not scraped:
-        raise HTTPException(status_code=502, detail="Could not extract content from any URL.")
+        raise HTTPException(status_code=502, detail="Jina AI could not extract content from any URL.")
+
     result = await extract_entities(query, scraped)
     result.total_sources_scraped = len(scraped)
     result.query = query
