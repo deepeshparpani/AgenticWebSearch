@@ -6,13 +6,23 @@ This system was completely re-architected from a basic scraper into a highly res
 
 ## Visual Architecture
 
-```mermaid
-flowchart LR
-    A[Search] -->|DuckDuckGo| B[The Bouncer]
-    B -->|Intent Filtering| C[Scraper Pool]
-    C -->|Fallback Retries| D[Input Diet Codec]
-    D -->|Context Compression| E[Model Waterfall]
-    E -->|Structured Output| F[Consensus UI]
+```text
+[ DuckDuckGo Search ] 
+        │
+        ▼
+[ The Bouncer (Intent Filtering/Blocklists) ]
+        │
+        ▼
+[ Scraper Pool (Jina AI → ZenRows → HTTP) ]
+        │
+        ▼
+[ Input Diet Codec (Context Compression) ]
+        │
+        ▼
+[ Model Waterfall (Gemini Flash → Lite) ]
+        │ 
+        ▼
+[ Spider-Verse UI (Structured Consensus) ]
 ```
 
 ## Core Engineering Challenges & Solutions
@@ -41,6 +51,19 @@ Coupled with a concurrent `fetch_with_retry` harness (`asyncio.gather`), intermi
 **The Agentic Solution — Model Waterfall & Pydantic:** 
 We built an exception-driven **Model Waterfall** inside `main.py`. The generative step smoothly cascades through `gemini-2.5-flash` → `flash-lite` → `2.0-flash` directly circumventing active 429 quota expirations via inline fallback logic. Additionally, extraction is clamped to a strict Pydantic model (`ExtractionResult`), demanding high-signal sub-15-word `ranking_rationale` justifications backed directly by their `source_url` for absolute traceability.
 
+## Deep Dive: Backend Code Logic
+
+### 1. `services.py` 
+* **Dynamic URL Targeting (`calculate_target_urls`):** Parses integers from the query text (e.g., "Top 5 pizzas" → 5) and buffers the request (+10) to actively determine how many URLs DuckDuckGo fetches. Clamps dynamically between 8 and 20 URLs to adapt gracefully to intent size.
+* **The Domain Router / "Bouncer" (`filter_clean_urls`):** Executes intent checks (`pizza`, `software`, `startup`, etc.) assigning the query cleanly to a dynamic intent group. Depending on the intent, it aggressively applies known login-gated domain exclusions (e.g., `.yelp.`, `.glassdoor.`) onto a generic blocklist.
+* **Scraper Pooling & Retry Loop (`fetch_with_retry`):** For each assigned URL, it iterates across a configurable `SCRAPER_POOL` array. This sequentially attempts Jina AI, ZenRows, and generic HTTP endpoints until it achieves a non-error `200 OK` response payload, entirely avoiding WAF / JS hurdles.
+* **Context Compression (`optimize_scraped_text`):** Before dumping text to the LLM, the raw string is wiped of generic English stop-words and chunked into individual sentence arrays. Using string matching, sentences containing primary query keywords organically "bubble" to the top of the LLM context buffer. Total buffer strings are hard truncated to minimize Gemini Time-To-First-Byte bottlenecks.
+
+### 2. `main.py`
+* **Stream Generation (`pipeline`):** Built utilizing FastAPI's `StreamingResponse`, the execution occurs inside a non-blocking `asyncio.Queue` loop. It pushes active state updates (`search_done`, `scrape_url_done`, `extract_done`) iteratively across the EventStream, allowing the frontend telemetry terminal to report exactly which individual URLs passed or blocked during extraction.
+* **Model Fallback Loop (`extract_entities`):** Intercepts standard generative requests utilizing an explicit `try...except` block mapped over the `MODEL_POOL` array. Upon encountering `429 Quota Exhausted` or `ResourceExhausted` errors, it handles the exception seamlessly and shifts generation to identical fallback counterparts.
+* **Deterministic Structured Validation:** Pydantic `BaseModel` classes strip LLM hallucination possibilities. The payload mandates sub-15-word boundaries on analytical rationales and verifies accurate tracking metrics via `total_sources_scraped`.
+
 ## UI Overview
 Our frontend now boasts a stylized "Spider-Verse" hacking interface, offering:
 * **Live Telemetry Stream:** A Server-Sent Events (SSE) feed outputting diagnostic lines to seamlessly represent active web traversing.
@@ -67,5 +90,14 @@ Our frontend now boasts a stylized "Spider-Verse" hacking interface, offering:
    ```
 
 ### Production Deployment
-**Backend (Render):** Deploy the `backend/` folder on Render utilizing Python configurations. Target `uvicorn main:app --host 0.0.0.0 --port $PORT` as the boot script, capturing the Gemini API Key inside Render Secrets.
-**Frontend (Vercel):** Connect the GitHub repository to the Vercel ecosystem, specifically pointing the Build configuration to initialize inside the `frontend` Root Directory. Vite natively builds and hosts the static generation.
+**Backend (Render):**
+1. Deploy the `backend/` folder on Render as a Web Service.
+2. **Build Command:** `pip install -r requirements.txt`
+3. **Start Command:** `uvicorn main:app --host 0.0.0.0 --port 10000`
+4. **Environment Variables:** Be sure to add `GEMINI_API_KEY` to Render's Environment Variables.
+
+**Frontend (Vercel):**
+1. Connect your GitHub repository to Vercel and set `frontend` as the Root Directory.
+2. Vercel will automatically detect the Vite architecture.
+3. **Environment Variables:** Add `VITE_API_URL` linking to your deployed Render backend URL (e.g., `https://your-app.onrender.com`).
+*(Our included `vercel.json` will automatically handle SPA routing fallbacks for you!)*
