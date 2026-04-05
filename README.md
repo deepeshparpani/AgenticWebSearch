@@ -6,13 +6,23 @@ This system was completely re-architected from a basic scraper into a highly res
 
 ## Visual Architecture
 
-```mermaid
-graph LR
-    Search --> Bouncer[The Bouncer]
-    Bouncer --> Scraper[Scraper Pool]
-    Scraper --> Compress[Input Diet Codec]
-    Compress --> Extract[Model Waterfall]
-    Extract --> UI[Consensus UI]
+```text
+[ DuckDuckGo Search ] 
+        │
+        ▼
+[ The Bouncer (Intent Filtering/Blocklists) ]
+        │
+        ▼
+[ Scraper Pool (Jina AI → ZenRows → HTTP) ]
+        │
+        ▼
+[ Input Diet Codec (Context Compression) ]
+        │
+        ▼
+[ Model Waterfall (Gemini Flash → Lite) ]
+        │
+        ▼
+[ Spider-Verse UI (Structured Consensus) ]
 ```
 
 ## Core Engineering Challenges & Solutions
