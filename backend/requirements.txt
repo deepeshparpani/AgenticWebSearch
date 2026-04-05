@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
-ddgs
-requests
+duckduckgo-search
+httpx
 google-genai
 pydantic
 python-dotenv
-httpx

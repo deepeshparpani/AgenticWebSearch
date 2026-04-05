@@ -39,7 +39,8 @@ export default function App() {
     // Reset to initial state, begin pipeline
     setState({ ...INITIAL, stage: 'search' });
 
-    const url = `http://localhost:8000/api/research/stream?query=${encodeURIComponent(searchQuery)}`;
+    const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+    const url = `${API_BASE}/api/research/stream?query=${encodeURIComponent(searchQuery)}`;
     const es = new EventSource(url);
     esRef.current = es;
 

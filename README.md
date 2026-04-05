@@ -67,5 +67,14 @@ Our frontend now boasts a stylized "Spider-Verse" hacking interface, offering:
    ```
 
 ### Production Deployment
-**Backend (Render):** Deploy the `backend/` folder on Render utilizing Python configurations. Target `uvicorn main:app --host 0.0.0.0 --port $PORT` as the boot script, capturing the Gemini API Key inside Render Secrets.
-**Frontend (Vercel):** Connect the GitHub repository to the Vercel ecosystem, specifically pointing the Build configuration to initialize inside the `frontend` Root Directory. Vite natively builds and hosts the static generation.
+**Backend (Render):**
+1. Deploy the `backend/` folder on Render as a Web Service.
+2. **Build Command:** `pip install -r requirements.txt`
+3. **Start Command:** `uvicorn main:app --host 0.0.0.0 --port 10000`
+4. **Environment Variables:** Be sure to add `GEMINI_API_KEY` to Render's Environment Variables.
+
+**Frontend (Vercel):**
+1. Connect your GitHub repository to Vercel and set `frontend` as the Root Directory.
+2. Vercel will automatically detect the Vite architecture.
+3. **Environment Variables:** Add `VITE_API_URL` linking to your deployed Render backend URL (e.g., `https://your-app.onrender.com`).
+*(Our included `vercel.json` will automatically handle SPA routing fallbacks for you!)*

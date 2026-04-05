@@ -67,7 +67,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -316,8 +316,6 @@ async def research(query: str = Query(..., min_length=3)):
 
     context = format_scraped_results(scraped)
     result = await extract_entities(query, context)
-    result.total_sources_scraped = len(scraped)
-    result.query = query
     return result
 
 
@@ -326,4 +324,6 @@ async def research(query: str = Query(..., min_length=3)):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
