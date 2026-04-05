@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-duckduckgo-search
+duckduckgo-search==6.3.0
 httpx
 google-genai
 pydantic
