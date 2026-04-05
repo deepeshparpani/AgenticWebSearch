@@ -14,7 +14,7 @@ import logging
 import re
 import httpx
 import requests
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 
 logger = logging.getLogger("agentic_search.services")
 
