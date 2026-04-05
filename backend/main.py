@@ -49,6 +49,12 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set. Add it to your .env file.")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_POOL = [
+    "gemini-2.5-flash", 
+    "gemini-2.5-flash-lite", 
+    "gemini-2.0-flash", 
+    "gemini-2.0-flash-lite"
+]
 
 # ---------------------------------------------------------------------------
 # FastAPI App
@@ -142,16 +148,26 @@ async def extract_entities(query: str, context: str) -> ExtractionResult:
     loop = asyncio.get_event_loop()
 
     def _call():
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ExtractionResult,
-                temperature=0.2,
-            ),
-        )
-        return response.text
+        for model_name in MODEL_POOL:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ExtractionResult,
+                        temperature=0.2,
+                    ),
+                )
+                return response.text
+            except Exception as e:
+                error_msg = str(e).lower()
+                status_code = getattr(e, "code", getattr(e, "status_code", None))
+                if "429" in error_msg or "exhausted" in error_msg or status_code == 429:
+                    logger.warning(f"[EXTRACT] 429 on {model_name}, falling back...")
+                    continue
+                raise e
+        raise RuntimeError("Critical: All models in the fallback pool are rate-limited.")
 
     raw = await loop.run_in_executor(None, _call)
     logger.info(f"[EXTRACT] Gemini response length={len(raw)} chars")

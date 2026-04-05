@@ -86,8 +86,8 @@ def search_web(query: str, max_results: int = 12) -> list[str]:
 # Scraping — Jina AI Reader (async, with retry)
 # ---------------------------------------------------------------------------
 
-JINA_BASE = "https://r.jina.ai/"
-JINA_TIMEOUT = 8.0       # seconds per request attempt
+SCRAPER_POOL = ["https://r.jina.ai/", "https://api.zenrows.com/v1/?url=", ""]
+JINA_TIMEOUT = 5.0       # seconds per request attempt
 JINA_RETRY_BACKOFF = 1.5  # seconds to wait between retry attempts
 MAX_CHARS_PER_PAGE = 4000
 
@@ -182,64 +182,62 @@ async def fetch_with_retry(
     Returns:
         {"url": str, "content": str} on success, or None if all attempts fail.
     """
-    jina_url = f"{JINA_BASE}{url}"
-
     for attempt in range(max_retries):
         is_last = attempt == max_retries - 1
-        try:
-            response = await client.get(
-                jina_url,
-                headers=_JINA_HEADERS,
-                timeout=JINA_TIMEOUT,
-            )
+        
+        for base_url in SCRAPER_POOL:
+            full_url = f"{base_url}{url}"
+            headers = _JINA_HEADERS if "jina" in base_url else {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-            if response.status_code == 200:
-                data = response.json()
-                raw_content = data.get("data", {}).get("content", "").strip()
+            try:
+                response = await client.get(
+                    full_url,
+                    headers=headers,
+                    timeout=JINA_TIMEOUT,
+                )
 
-                if raw_content:
-                    # ✅ Success — compress then return, no further retries
-                    content = optimize_scraped_text(raw_content, query, MAX_CHARS_PER_PAGE)
-                    logger.info(
-                        f"[SCRAPE] OK  {url} ({len(content)} chars, "
-                        f"attempt {attempt + 1}/{max_retries})"
+                if response.status_code == 200:
+                    if "jina" in base_url:
+                        data = response.json()
+                        raw_content = data.get("data", {}).get("content", "").strip()
+                    else:
+                        raw_content = response.text.strip()
+
+                    if raw_content:
+                        # ✅ Success — compress then return, no further retries
+                        content = optimize_scraped_text(raw_content, query, MAX_CHARS_PER_PAGE)
+                        logger.info(
+                            f"[SCRAPE] OK via {base_url}  {url} ({len(content)} chars, "
+                            f"attempt {attempt + 1}/{max_retries})"
+                        )
+                        return {"url": url, "content": content}
+
+                    logger.warning(
+                        f"[SCRAPE] Empty content for {url} via {base_url} "
+                        f"(attempt {attempt + 1}/{max_retries})"
                     )
-                    return {"url": url, "content": content}
+                else:
+                    logger.warning(
+                        f"[SCRAPE] Failed via {base_url}, rotating... HTTP {response.status_code} for {url} "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    continue
 
+            except (httpx.TimeoutException, httpx.RequestError, KeyError, ValueError) as exc:
                 logger.warning(
-                    f"[SCRAPE] Empty content for {url} "
+                    f"[SCRAPE] Failed via {base_url}, rotating... Exception: {type(exc).__name__} for {url} "
                     f"(attempt {attempt + 1}/{max_retries})"
                 )
-            else:
-                logger.warning(
-                    f"[SCRAPE] HTTP {response.status_code} for {url} "
-                    f"(attempt {attempt + 1}/{max_retries})"
-                )
-
-        except httpx.TimeoutException:
-            logger.warning(
-                f"[SCRAPE] Timeout after {JINA_TIMEOUT}s for {url} "
-                f"(attempt {attempt + 1}/{max_retries})"
-            )
-        except httpx.RequestError as exc:
-            logger.warning(
-                f"[SCRAPE] Request error for {url} "
-                f"(attempt {attempt + 1}/{max_retries}): {exc}"
-            )
-        except (KeyError, ValueError) as exc:
-            logger.warning(
-                f"[SCRAPE] Bad JSON from Jina for {url} "
-                f"(attempt {attempt + 1}/{max_retries}): {exc}"
-            )
+                continue
 
         # Backoff before retry — skip sleep on the very last attempt
         if not is_last:
             logger.info(
-                f"[SCRAPE] Backing off {JINA_RETRY_BACKOFF}s before retry → {url}"
+                f"[SCRAPE] Backing off {JINA_RETRY_BACKOFF}s before next attempt → {url}"
             )
             await asyncio.sleep(JINA_RETRY_BACKOFF)
 
-    logger.warning(f"[SCRAPE] All {max_retries} attempts exhausted for {url}")
+    logger.warning(f"[SCRAPE] All {max_retries} attempts and fallbacks exhausted for {url}")
     return None
 
 

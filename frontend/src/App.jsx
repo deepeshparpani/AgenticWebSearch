@@ -189,7 +189,7 @@ export default function App() {
 
       <footer className="app-footer">
         <span className="footer-item">🔍 DuckDuckGo Search</span>
-        <span className="footer-item">🕸️ Trafilatura Scraper</span>
+        <span className="footer-item">🕸️ JINA AI Scraper</span>
         <span className="footer-item">✨ Gemini 2.5 Flash</span>
       </footer>
     </div>
