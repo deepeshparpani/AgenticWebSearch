@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 ddgs
-trafilatura
+requests
 google-genai
 pydantic
 python-dotenv

@@ -1,202 +1,71 @@
-# 🔍 Agentic Search & Entity Extraction
+# Agentic Search Pipeline 🕸️
 
-> A full-stack system that takes a natural language query, autonomously searches the web, scrapes content, and uses an LLM to extract structured entities — all with source traceability.
+**A resilient, production-grade AI research system built for the Agentic Search Challenge.**
 
----
+This system was completely re-architected from a basic scraper into a highly resilient node-traversal pipeline. It autonomously executes queries via DuckDuckGo, performs semantic noise reduction, applies an aggressive "Input Diet" to scraped context, and leverages a tiered model waterfall (Gemini Flash & Lite) to strictly output deterministic Pydantic schemas. 
 
-## Architecture Overview
+## Visual Architecture
 
-```
-User Query
-   │
-   ▼
-┌──────────────────────────────────────────────────────────┐
-│  FastAPI Backend  (Python 3.11+)                         │
-│                                                          │
-│  1. [SEARCH]   DuckDuckGo → top 5 URLs                   │
-│  2. [SCRAPE]   httpx + Trafilatura → clean text          │
-│  3. [EXTRACT]  Gemini 1.5 Flash → structured JSON        │
-└──────────────────────────────────────────────────────────┘
-   │
-   ▼
-┌──────────────────────────────────────────────────────────┐
-│  React + Vite Frontend                                   │
-│  - Animated pipeline status display                      │
-│  - Entity table with clickable source links              │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A[Search] -->|DuckDuckGo| B[The Bouncer]
+    B -->|Intent Filtering| C[Scraper Pool]
+    C -->|Fallback Retries| D[Input Diet Codec]
+    D -->|Context Compression| E[Model Waterfall]
+    E -->|Structured Output| F[Consensus UI]
 ```
 
----
+## Core Engineering Challenges & Solutions
 
-## Design Rationale
+### 1. Anti-Bot Protections & CAPTCHA Walls
+**The Problem:** Traditional enterprise directories (e.g., Yelp, TripAdvisor, G2) aggressively block headless scrapers with JS rendering hurdles and CAPTCHA loops.
+**The Agentic Solution — "The Bouncer":** We implemented a **Dynamic Domain Router** (`filter_clean_urls`) that preemptively analyzes the semantic bounds of the query intent (Food, Tech, Business) and aggressively applies an intention-specific blocklist. The pipeline never attempts to scrape known hostile nodes.
 
-### Approach: Two-Stage Open-Source Pipeline
+### 2. The JavaScript Wall & Scraping Redundancy
+**The Problem:** The standard `trafilatura` library couldn't decode React/SPA heavy sites, generating empty contexts.
+**The Agentic Solution — Scraper Fallback Pool:** We switched to proxy APIs routing requests. Rather than risking single points of failure, `services.py` leverages a robust `SCRAPER_POOL`:
+1. **Jina AI Reader:** Full JS rendering and markdown conversion.
+2. **ZenRows API:** Bot-protection bypass fallback.
+3. **Direct HTTP:** A raw fetch fallback.
+Coupled with a concurrent `fetch_with_retry` harness (`asyncio.gather`), intermittent 403s and blockades are completely absorbed without terminating parallel extractions.
 
-The scraping pipeline relies entirely on **free, open-source tools**, which is a deliberate design choice:
+### 3. Context Window Latency (The "Input Diet")
+**The Problem:** Feeding raw dumps of multiple full 5,000-word webpages into Gemini Flash resulted in poor latency, high token costs, and noisy synthesis.
+**The Agentic Solution — Heuristic Compression:** We completely rebuilt the `optimize_scraped_text` pipeline.
+1. **Keyword Bubbling:** Identifies significant query keywords and forces relevant sentences to the top of the context buffer.
+2. **Stop-Word Shredding:** Strips non-vital filler English tokens to squeeze massive density into bounded context blocks.
+3. **Hard Truncation Guards:** Strict boundaries are maintained so TTFB generation times remain blazing fast.
 
-| Layer | Tool | Reason for Choice |
-|-------|------|-------------------|
-| Search | `duckduckgo-search` | Zero cost, no API key required, generous rate limits for development |
-| Scraping | `trafilatura` | State-of-the-art boilerplate removal; outperforms BeautifulSoup for main-content extraction in benchmarks |
-| HTTP | `httpx` | Async-native; allows concurrent scraping of all 5 URLs simultaneously, cutting total scrape time by ~5× |
+### 4. Free-Tier Rate Limits (429s) & Hallucination
+**The Problem:** API requests are subject to strict free-quota curtailment. Without mitigation, the entire async pipeline shatters on an arbitrary 429 block.
+**The Agentic Solution — Model Waterfall & Pydantic:** 
+We built an exception-driven **Model Waterfall** inside `main.py`. The generative step smoothly cascades through `gemini-2.5-flash` → `flash-lite` → `2.0-flash` directly circumventing active 429 quota expirations via inline fallback logic. Additionally, extraction is clamped to a strict Pydantic model (`ExtractionResult`), demanding high-signal sub-15-word `ranking_rationale` justifications backed directly by their `source_url` for absolute traceability.
 
-This eliminates the $50–$300/month cost of paid search APIs (Tavily, Serper, Bing) while maintaining production-grade reliability for most queries.
+## UI Overview
+Our frontend now boasts a stylized "Spider-Verse" hacking interface, offering:
+* **Live Telemetry Stream:** A Server-Sent Events (SSE) feed outputting diagnostic lines to seamlessly represent active web traversing.
+* **Pipeline Progress Tracker:** Stitched natively alongside the DOM for real-time visualization of computation vectors.
+* **Consensus Cards:** The final structured payload features physically-simulated panel cards showcasing their individual `ranking_rationale` mapping paired alongside verifiable URL linking. 
 
-### LLM Strategy: Gemini 1.5 Flash + Structured Outputs
+## Setup & Deployment
 
-**Why Gemini 1.5 Flash?**
+### Local Environment
+1. Clone the repo. 
+2. Create `backend/.env` with your `GEMINI_API_KEY`.
+3. Start the Backend API: 
+   ```bash
+   cd backend
+   python -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   uvicorn main:app --reload
+   ```
+4. Start the Frontend React Client:
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
 
-- **1M token context window** — can ingest full scraped content from multiple pages without chunking or retrieval hacks.
-- **Native JSON schema enforcement** (`response_mime_type: application/json` + `response_schema`) eliminates post-processing regex hacks and guarantees valid, typed output on the first call.
-- **Speed/Cost balance** — Flash is ~10× cheaper than Pro while being fast enough for interactive UX (typically 1–3s inference time).
-
-**Source Traceability**
-
-The prompt explicitly instructs the model to populate `source_url` with *only* the URLs present in the labeled `--- SOURCE N ---` blocks. The Pydantic schema enforces this field is always present, creating a hard binding between each entity and its origin.
-
----
-
-## Trade-offs & Known Limitations
-
-| Limitation | Detail |
-|------------|--------|
-| **Latency** | The scraping pipeline takes **5–15 seconds** end-to-end. Paid APIs like Tavily return pre-indexed content in <1s. We mitigate this with concurrent async scraping and a streaming loading UI. |
-| **SPA Resistance** | Sites built with React/Angular/Vue that require JavaScript rendering (SPAs) will return empty shells. Trafilatura degrades gracefully by returning `None`, and those URLs are skipped. A headless browser (Playwright) could solve this at the cost of significantly higher latency. |
-| **Rate Limits** | DuckDuckGo imposes undocumented rate limits. High-frequency usage (e.g., automated testing loops) can trigger temporary blocks. Back off or use a proxy if encountered. |
-| **Paywalled Content** | Subscription-based sites (news, academic journals) often serve empty article previews. The system skips these gracefully. |
-| **URL Hallucination** | The prompt strictly forbids the LLM from inventing URLs, but hallucination is never 0%. The UI should ideally validate returned URLs against the original search result list (future improvement). |
-
----
-
-## Project Structure
-
-```
-agentic-search/
-├── README.md
-├── backend/
-│   ├── .env.example       ← copy to .env and add your API key
-│   ├── requirements.txt
-│   └── main.py            ← FastAPI app (search → scrape → extract)
-└── frontend/
-    ├── index.html
-    ├── package.json
-    ├── vite.config.js
-    └── src/
-        ├── main.jsx
-        ├── App.jsx
-        ├── App.css
-        └── components/
-            ├── SearchBar.jsx
-            ├── PipelineStatus.jsx
-            └── EntityTable.jsx
-```
-
----
-
-## Setup & Running Locally
-
-### Prerequisites
-
-- Python 3.10+
-- Node.js 18+
-- A free [Gemini API key](https://aistudio.google.com/app/apikey)
-
----
-
-### Backend Setup
-
-```bash
-# 1. Navigate to the backend directory
-cd agentic-search/backend
-
-# 2. Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate        # macOS/Linux
-# .venv\Scripts\activate         # Windows
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure your API key
-cp .env.example .env
-# Now open .env and replace "your_gemini_api_key_here" with your actual key
-
-# 5. Start the backend server
-uvicorn main:app --reload --port 8000
-```
-
-The API will be available at `http://localhost:8000`.  
-Interactive docs: `http://localhost:8000/docs`
-
----
-
-### Frontend Setup
-
-```bash
-# 1. Navigate to the frontend directory
-cd agentic-search/frontend
-
-# 2. Install Node dependencies
-npm install
-
-# 3. Start the development server
-npm run dev
-```
-
-The UI will be available at `http://localhost:5173`.
-
----
-
-### Quick Test (curl)
-
-```bash
-curl "http://localhost:8000/api/research?query=open+source+database+tools" | python3 -m json.tool
-```
-
----
-
-## API Reference
-
-### `GET /api/research`
-
-**Query Parameters:**
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `query` | string | ✅ | Natural language research topic (min 3 chars) |
-
-**Response Schema:**
-
-```json
-{
-  "query": "open source database tools",
-  "total_sources_scraped": 4,
-  "entities": [
-    {
-      "name": "PostgreSQL",
-      "description": "A powerful, open-source object-relational database system...",
-      "key_features": ["ACID compliance", "JSON support", "Full-text search", "Extensible"],
-      "source_url": "https://example.com/article-about-databases",
-      "category": "Database"
-    }
-  ]
-}
-```
-
----
-
-## Evaluation Criteria Checklist
-
-- ✅ **Search**: DuckDuckGo retrieves top 5 URLs for any natural language query
-- ✅ **Scrape**: Trafilatura extracts clean main content; bad URLs are skipped gracefully
-- ✅ **Extract**: Gemini 1.5 Flash with enforced JSON schema produces structured entities
-- ✅ **Traceability**: Every entity includes a `source_url` tied to a scraped page
-- ✅ **Frontend**: React UI with animated pipeline status + responsive entity table
-- ✅ **Error Handling**: HTTP timeouts, scraping failures, and API errors are all handled
-- ✅ **Zero Cost**: No paid APIs required beyond Gemini's generous free tier
-
----
-
-## License
-
-MIT
+### Production Deployment
+**Backend (Render):** Deploy the `backend/` folder on Render utilizing Python configurations. Target `uvicorn main:app --host 0.0.0.0 --port $PORT` as the boot script, capturing the Gemini API Key inside Render Secrets.
+**Frontend (Vercel):** Connect the GitHub repository to the Vercel ecosystem, specifically pointing the Build configuration to initialize inside the `frontend` Root Directory. Vite natively builds and hosts the static generation.

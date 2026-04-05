@@ -787,6 +787,71 @@ body::after {
   flex-shrink: 0;
 }
 
+/* Entity rank badge */
+.entity-rank {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  margin-bottom: 4px;
+  letter-spacing: 0.04em;
+}
+
+/* "Why this?" toggle button */
+.rationale-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 3px 10px;
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'Inter', sans-serif;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.rationale-toggle:hover,
+.rationale-toggle.open {
+  background: rgba(108, 99, 255, 0.08);
+  border-color: var(--border-accent);
+  color: var(--accent-secondary);
+}
+
+/* Expandable rationale row */
+.rationale-row td {
+  padding: 0 !important;
+  border-bottom: 1px solid var(--border);
+}
+
+.rationale-content {
+  padding: 14px 20px 16px;
+  background: rgba(108, 99, 255, 0.05);
+  border-left: 3px solid var(--accent-primary);
+  animation: fadeSlideIn 0.2s ease both;
+}
+
+.rationale-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent-secondary);
+  margin-bottom: 6px;
+}
+
+.rationale-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.65;
+  font-style: italic;
+}
+
 /* ============================
    Error State
    ============================ */
