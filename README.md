@@ -7,12 +7,12 @@ This system was completely re-architected from a basic scraper into a highly res
 ## Visual Architecture
 
 ```mermaid
-flowchart LR
-    A["Search"] -->|"DuckDuckGo"| B["The Bouncer"]
-    B -->|"Intent Filtering"| C["Scraper Pool"]
-    C -->|"Fallback Retries"| D["Input Diet Codec"]
-    D -->|"Context Compression"| E["Model Waterfall"]
-    E -->|"Structured Output"| F["Consensus UI"]
+graph LR
+    Search --> Bouncer[The Bouncer]
+    Bouncer --> Scraper[Scraper Pool]
+    Scraper --> Compress[Input Diet Codec]
+    Compress --> Extract[Model Waterfall]
+    Extract --> UI[Consensus UI]
 ```
 
 ## Core Engineering Challenges & Solutions
